@@ -1,8 +1,10 @@
 # hw1
 
 * Execute this howework.
-> main.py
+> python main.py
 
+* folder structure
+```
 .
 ├── data
 │   ├── processed_test_with_invalid_val.csv
@@ -27,3 +29,4 @@
 │   └── report.pdf
 ├── submission.csv
 └── utils.py
+```
