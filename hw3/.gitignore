@@ -1,2 +1,4 @@
 train/
 test/
+*.pth
+*.pkl
