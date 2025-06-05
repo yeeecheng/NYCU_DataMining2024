@@ -117,7 +117,7 @@ if __name__ == '__main__':
     news_df = pd.read_csv(args.news_path, sep='\t', header=0)
     news_map = build_vocab_and_encode(news_df, tokenizer, cat2id=cat2id, ent2id=ent2id, max_len=args.max_len)
 
-    model = DSSMModel(vocab_size=tokenizer.vocab_size, cat_size=len(cat2id)+1, ent_size=len(ent2id)+1, emb_dim=args.emb_dim)
+    model = DSSMModel(vocab_size=tokenizer.vocab_size, cat_size=len(cat2id), ent_size=len(ent2id), emb_dim=args.emb_dim)
     model.load_state_dict(torch.load(args.model_path, map_location=device))
     model.to(device)
 
