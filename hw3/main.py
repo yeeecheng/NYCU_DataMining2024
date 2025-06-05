@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -182,6 +182,27 @@ def train_one_epoch(model, loader, optimizer, margin, device):
         total_loss += loss.item()
     return total_loss / len(loader)
 
+@torch.no_grad()
+def evaluate(model, loader, margin, device):
+    """Evaluate on validation set using the same ranking loss."""
+    model.eval()
+    total_loss = 0
+    for clicks, pos, neg, click_cats, pos_cats, neg_cats, click_ents, pos_ents, neg_ents in loader:
+        clicks = clicks.to(device)
+        pos = pos.to(device)
+        neg = neg.to(device)
+        click_cats = click_cats.to(device)
+        pos_cats = pos_cats.to(device)
+        neg_cats = neg_cats.to(device)
+        click_ents = click_ents.to(device)
+        pos_ents = pos_ents.to(device)
+        neg_ents = neg_ents.to(device)
+
+        pos_score, neg_score = model(clicks, pos, neg, click_cats, pos_cats, neg_cats, click_ents, pos_ents, neg_ents)
+        loss = F.margin_ranking_loss(pos_score, neg_score, torch.ones_like(pos_score), margin=margin)
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
 # ==== 6. Main Entry ====
 if __name__ == '__main__':
     import argparse
@@ -195,6 +216,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_len', type=int, default=80)
     parser.add_argument('--margin', type=float, default=1.0)
     parser.add_argument('--save_model', type=str, default='dssm_full_entity.pth')
+    parser.add_argument('--val_split', type=float, default=0.1, help='Fraction of data used for validation')
     args = parser.parse_args()
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -207,17 +229,30 @@ if __name__ == '__main__':
     print("[INFO] Building triplets...")
     triplets = build_triplets(behaviors_df, news_map, cat2id, ent2id)
 
-    loader = DataLoader(TripletSet(triplets), batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    dataset = TripletSet(triplets)
+    if args.val_split > 0:
+        train_len = int(len(dataset) * (1 - args.val_split))
+        val_len = len(dataset) - train_len
+        train_set, val_set = random_split(dataset, [train_len, val_len])
+    else:
+        train_set, val_set = dataset, None
+
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    val_loader = None if val_set is None else DataLoader(val_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
 
     model = DSSMModel(tokenizer.vocab_size, len(cat2id), len(ent2id), emb_dim=args.emb_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    best_loss = float('inf')
+    best_val = float('inf')
     for epoch in range(args.epochs):
-        loss = train_one_epoch(model, loader, optimizer, args.margin, device)
-        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {loss:.4f}")
-        if loss < best_loss:
-            best_loss = loss
+        train_loss = train_one_epoch(model, train_loader, optimizer, args.margin, device)
+        if val_loader is not None:
+            val_loss = evaluate(model, val_loader, args.margin, device)
+        else:
+            val_loss = train_loss
+        print(f"Epoch {epoch+1}/{args.epochs} - Train loss: {train_loss:.4f} - Val loss: {val_loss:.4f}")
+        if val_loss < best_val:
+            best_val = val_loss
             print(f"✅ New best model found! Saving...")
             torch.save(model.state_dict(), str(epoch) + "_" + args.save_model)
 
