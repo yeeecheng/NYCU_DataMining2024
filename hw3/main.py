@@ -147,6 +147,18 @@ def collate_fn(batch):
     click_ents = nn.utils.rnn.pad_sequence(click_ents, batch_first=True)
     return clicks, torch.stack(pos), torch.stack(neg), click_cats, torch.stack(pos_cats), torch.stack(neg_cats), click_ents, torch.stack(pos_ents), torch.stack(neg_ents)
 
+# Dataset for triplets. Defined at top level so it can be pickled by
+# DataLoader workers when `num_workers > 0`.
+class TripletSet(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
 # ==== 5. Training ====
 def train_one_epoch(model, loader, optimizer, margin, device):
     model.train()
@@ -195,15 +207,9 @@ if __name__ == '__main__':
     print("[INFO] Building triplets...")
     triplets = build_triplets(behaviors_df, news_map, cat2id, ent2id)
 
-    class TripletSet(torch.utils.data.Dataset):
-        def __init__(self, data):
-            self.data = data
-        def __len__(self): return len(self.data)
-        def __getitem__(self, i): return self.data[i]
-
     loader = DataLoader(TripletSet(triplets), batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
 
-    model = DSSMModel(tokenizer.vocab_size, len(cat2id)+1, len(ent2id)+1, emb_dim=args.emb_dim).to(device)
+    model = DSSMModel(tokenizer.vocab_size, len(cat2id), len(ent2id), emb_dim=args.emb_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     best_loss = float('inf')
