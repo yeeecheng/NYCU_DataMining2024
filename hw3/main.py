@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score
@@ -18,7 +18,7 @@ from tqdm import tqdm
 class NewsEncoder(nn.Module):
     def __init__(self, vocab_size, cat_size, ent_size, emb_dim=128):
         super().__init__()
-        self.word_emb = nn.Embedding(vocab_size + 1000, emb_dim, padding_idx=0)
+        self.word_emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
         self.cat_emb = nn.Embedding(cat_size + 1, emb_dim)
         self.ent_emb = nn.Embedding(ent_size + 1, emb_dim)
         self.linear = nn.Linear(emb_dim * 3, emb_dim)
@@ -48,7 +48,7 @@ class NewsEncoder(nn.Module):
 class UserEncoder(nn.Module):
     def __init__(self, emb_dim=128):
         super().__init__()
-        self.attn = nn.MultiheadAttention(emb_dim, num_heads=4, batch_first=True)
+        self.attn = nn.MultiheadAttention(emb_dim, num_heads=2, batch_first=True)
         self.linear = nn.Linear(emb_dim, emb_dim)
 
     def forward(self, clicked_vecs):
@@ -113,7 +113,7 @@ def build_triplets(behaviors_df, news_map, cat2id, ent2id, max_clicks=10):
         if not pos_ids or not neg_ids:
             continue
         for pos_id in pos_ids:
-            for _ in range(2):
+            for _ in range(10):
                 neg_id = random.choice(neg_ids)
                 click_vecs, click_cats, click_ents = [], [], []
                 for cid in clicks:
@@ -147,6 +147,18 @@ def collate_fn(batch):
     click_ents = nn.utils.rnn.pad_sequence(click_ents, batch_first=True)
     return clicks, torch.stack(pos), torch.stack(neg), click_cats, torch.stack(pos_cats), torch.stack(neg_cats), click_ents, torch.stack(pos_ents), torch.stack(neg_ents)
 
+# Dataset for triplets. Defined at top level so it can be pickled by
+# DataLoader workers when `num_workers > 0`.
+class TripletSet(Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
 # ==== 5. Training ====
 def train_one_epoch(model, loader, optimizer, margin, device):
     model.train()
@@ -170,6 +182,27 @@ def train_one_epoch(model, loader, optimizer, margin, device):
         total_loss += loss.item()
     return total_loss / len(loader)
 
+@torch.no_grad()
+def evaluate(model, loader, margin, device):
+    """Evaluate on validation set using the same ranking loss."""
+    model.eval()
+    total_loss = 0
+    for clicks, pos, neg, click_cats, pos_cats, neg_cats, click_ents, pos_ents, neg_ents in loader:
+        clicks = clicks.to(device)
+        pos = pos.to(device)
+        neg = neg.to(device)
+        click_cats = click_cats.to(device)
+        pos_cats = pos_cats.to(device)
+        neg_cats = neg_cats.to(device)
+        click_ents = click_ents.to(device)
+        pos_ents = pos_ents.to(device)
+        neg_ents = neg_ents.to(device)
+
+        pos_score, neg_score = model(clicks, pos, neg, click_cats, pos_cats, neg_cats, click_ents, pos_ents, neg_ents)
+        loss = F.margin_ranking_loss(pos_score, neg_score, torch.ones_like(pos_score), margin=margin)
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
 # ==== 6. Main Entry ====
 if __name__ == '__main__':
     import argparse
@@ -179,10 +212,11 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--emb_dim', type=int, default=128)
-    parser.add_argument('--max_len', type=int, default=80)
+    parser.add_argument('--emb_dim', type=int, default=32)
+    parser.add_argument('--max_len', type=int, default=40)
     parser.add_argument('--margin', type=float, default=1.0)
     parser.add_argument('--save_model', type=str, default='dssm_full_entity.pth')
+    parser.add_argument('--val_split', type=float, default=0.1, help='Fraction of data used for validation')
     args = parser.parse_args()
 
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
@@ -195,26 +229,19 @@ if __name__ == '__main__':
     print("[INFO] Building triplets...")
     triplets = build_triplets(behaviors_df, news_map, cat2id, ent2id)
 
-    class TripletSet(torch.utils.data.Dataset):
-        def __init__(self, data):
-            self.data = data
-        def __len__(self): return len(self.data)
-        def __getitem__(self, i): return self.data[i]
+    dataset = TripletSet(triplets)
+    if args.val_split > 0:
+        train_len = int(len(dataset) * (1 - args.val_split))
+        val_len = len(dataset) - train_len
+        train_set, val_set = random_split(dataset, [train_len, val_len])
+    else:
+        train_set, val_set = dataset, None
 
-    loader = DataLoader(TripletSet(triplets), batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=16)
+    val_loader = None if val_set is None else DataLoader(val_set, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=16)
 
-    model = DSSMModel(tokenizer.vocab_size, len(cat2id)+1, len(ent2id)+1, emb_dim=args.emb_dim).to(device)
+    model = DSSMModel(tokenizer.vocab_size, len(cat2id), len(ent2id), emb_dim=args.emb_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    best_loss = float('inf')
-    for epoch in range(args.epochs):
-        loss = train_one_epoch(model, loader, optimizer, args.margin, device)
-        print(f"Epoch {epoch+1}/{args.epochs} - Loss: {loss:.4f}")
-        if loss < best_loss:
-            best_loss = loss
-            print(f"✅ New best model found! Saving...")
-            torch.save(model.state_dict(), str(epoch) + "_" + args.save_model)
-
     import pickle
     # ✅ Save category and entity mappings
     with open('cat2id.pkl', 'wb') as f:
@@ -222,3 +249,16 @@ if __name__ == '__main__':
     with open('ent2id.pkl', 'wb') as f:
         pickle.dump(ent2id, f)
     print("✅ cat2id and ent2id mappings saved.")
+
+    best_val = float('inf')
+    for epoch in range(args.epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, args.margin, device)
+        if val_loader is not None:
+            val_loss = evaluate(model, val_loader, args.margin, device)
+        else:
+            val_loss = train_loss
+        print(f"Epoch {epoch+1}/{args.epochs} - Train loss: {train_loss:.4f} - Val loss: {val_loss:.4f}")
+        if val_loss < best_val:
+            best_val = val_loss
+            print(f"✅ New best model found! Saving...")
+            torch.save(model.state_dict(), str(epoch) + "_" + args.save_model)
